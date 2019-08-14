@@ -290,9 +290,11 @@ def main(arguments):
     parser.add_argument('--stack_region',
                         default='us-west-1')
     parser.add_argument('--admin_username')
+    # TODO add a way to pass in organization unit name, if not found then default to account name
+    # currently it uses account name and that may be unfavorable.
+    # TODO uncomment this line and test the deploy resources functions 
     # parser.add_argument(action='store_true', dest='admin_password', help='hidden password prompt')
     args = parser.parse_args(arguments)
-
     # if args.admin_password:
     #     admin_password = getpass(prompt='Please enter the admin password: ')
 
