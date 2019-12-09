@@ -1,0 +1,320 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Baseline IAM resources for new account
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Parameters:
+      - ResourcePrefix
+      - clientBucketName
+      Label:
+        Default: Tagging
+    - Parameters:
+      - clientSourceARN # If necessary change from source arn to client username to create user to assume role.
+      # - clientS3AccessCIDR
+      Label:
+        Default: client User and Role Configuration
+    - Parameters: 
+      - S3clientUser
+      - S3clientPassword
+      Label:
+        Default:  Dev Access to Bucket
+      
+
+Parameters:
+  ResourcePrefix: 
+    AllowedValues:  [dev, qa, stag, perf, prod]
+    Description: Prefix used for naming the resources created in the stack with the format ${ResourcePrefix}-<resource>
+    ConstraintDescription: Must contain only lower case letters and minimum string length is 5.
+    Default: dev
+    Type: String
+  clientBucketName: 
+    Description: This is a descriptive name to give this bucket.
+    ConstraintDescription: Must contain only lower case letters and minimum string length is 5.
+    Default: client
+    Type: String
+    AllowedPattern: '[a-z0-9\-]{3,10}'
+  clientSourceARN: 
+    Type: String
+    Description: Arn for the client source account
+    Default: "arn:aws:iam::1111111111:root"
+  clientS3AccessCIDR:
+    Type: String
+    Description: The ranges that client will be replicating the client data from.  Leave blank to allow from any IP.
+    Default: "107.77.199.41/32"
+  S3clientUser:
+    Type: String
+    Description: Username for the client Admin user
+    Default: "User"
+  S3clientPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Password for the client Admin user
+
+Resources:
+  # Create the bucket
+  clientS3Bucket:
+    # TODO add logging config
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      AccessControl: Private
+      BucketName: 
+        Ref: clientBucketName
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration: 
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Ref clientBucketName
+# this policy will block http connections to the bucket by default and give access to client to replicate to it.
+  denyHTTPPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+       Ref: clientS3Bucket
+      PolicyDocument:
+        Statement:
+        - Sid: noHTTPPolicy
+          Effect: Deny
+          Principal: "*"
+          Action: s3:*
+          Resource: !Sub "arn:aws:s3:::${clientS3Bucket}/*"
+          Condition:
+            Bool:
+              aws:SecureTransport: 'false'
+        - Sid: clientReplicationPolicy
+          Effect: Allow
+          Action:
+          - s3:ReplicateObject
+          - s3:ReplicateDelete
+          - s3:GetBucketVersioning
+          - s3:PutBucketVersioning
+          - s3:ObjectOwnerOverrideToBucketOwner
+          Resource: 
+          - !Sub "arn:aws:s3:::${clientS3Bucket}"
+          - !Sub "arn:aws:s3:::${clientS3Bucket}/*"
+          Principal:
+            AWS: 
+              Ref: clientSourceARN
+    DependsOn: clientS3Bucket
+
+  #  Since it is AWS to AWS, source IP may not be feasible, but we will see to force mfa
+  # Bool:
+  # aws:MultiFactorAuthPresent: 'true'
+  # a potential way to enforce giving replicated bucket objects ownership to us:
+  #           # Since this is a replication job, they have different ways to change owner of objects..
+  #           # StringEquals: 
+  #           #   s3:x-amz-grant-full-control: [
+  #           #     Ref: BucketOwner
+  #           #   ]
+
+  # Create internal user policy to use.
+  UserS3ObjectPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      PolicyDocument: 
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:*Object
+          - s3:*Object*
+          - s3:List*
+          Resource: 
+          - !Sub "arn:aws:s3:::${clientS3Bucket}"
+          - !Sub "arn:aws:s3:::${clientS3Bucket}/*"
+          Condition:
+            IpAddress:
+              aws:SourceIp: [
+                107.77.199.41/32,
+                107.77.199.42/32
+              ]
+        - Effect: Allow
+          Action:
+          - s3:GetBucketLocation
+          - s3:ListAllMyBuckets
+          - s3:ListJobs
+          Resource: "*"
+          Condition:
+            IpAddress:
+              aws:SourceIp: [
+                107.77.199.41/32,
+                107.77.199.42/32
+              ]
+        - Effect: Allow
+          Action:
+          - iam:CreateAccessKey
+          - iam:DeleteAccessKey
+          - iam:GetAccessKeyLastUsed
+          - iam:GetUser
+          - iam:ListAccessKeys
+          - iam:UpdateAccessKey
+          Resource: arn:aws:iam::*:user/${aws:username}
+          Condition:
+            IpAddress:
+              aws:SourceIp: [
+                107.77.199.41/32,
+                107.77.199.42/32
+              ]
+      ManagedPolicyName: UsersPolicy
+    DependsOn: clientS3Bucket
+
+  UserGroup: 
+    Type: 'AWS::IAM::Group'
+    Properties: 
+      GroupName: 
+        Fn::Join: [ '-', [ Ref: ResourcePrefix, "clientS3Group" ] ]
+      ManagedPolicyArns: 
+      - !Ref UserS3ObjectPolicy
+    DependsOn: 
+    - UserS3ObjectPolicy
+
+  UserResource:
+    Type: 'AWS::IAM::User'
+    Properties:
+      UserName: 
+        Ref: S3clientUser
+      Path: /
+      LoginProfile:
+        Password: 
+          Ref: S3clientPassword
+      Groups: 
+      - Ref: UserGroup
+    DependsOn: 
+    - UserGroup
+
+
+# Create the service account:
+  ServiceAccountLogin:
+    Type: 'AWS::IAM::User'
+    Properties:
+      UserName: "svc-dev"
+      Path: /
+      LoginProfile:
+        Password: 
+          Ref: S3clientPassword
+
+# Create policy for service account to assume a role from
+  S3Role: 
+    Type: 'AWS::IAM::Role'
+    Properties: 
+      RoleName: 
+        Fn::Join: [ '-', [ Ref: ResourcePrefix, "ServiceRole" ] ]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              AWS: 
+                !GetAtt ServiceAccountLogin.Arn
+            Action: 
+              - "sts:AssumeRole"
+      Policies: 
+        - PolicyName:
+            Fn::Join: [ '-', [ Ref: ResourcePrefix, "ServiceRole" ] ]
+          PolicyDocument: 
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - s3:*Object*
+              - s3:List*
+              Resource: 
+              - !Sub "arn:aws:s3:::${clientS3Bucket}"
+              - !Sub "arn:aws:s3:::${clientS3Bucket}/*"
+              Condition:
+                IpAddress:
+                  aws:SourceIp: [
+                    107.77.199.41/32
+                  ]
+            - Effect: Allow
+              Action:
+              - iam:CreateAccessKey
+              - iam:DeleteAccessKey
+              - iam:GetAccessKeyLastUsed
+              - iam:GetUser
+              - iam:ListAccessKeys
+              - iam:UpdateAccessKey
+              Resource: arn:aws:iam::*:user/${aws:username}
+              Condition:
+                IpAddress:
+                  aws:SourceIp: [
+                    107.77.199.41/32
+                  ]
+      # MaxSessionDuration: 6000
+    DependsOn: 
+    - ServiceAccountLogin
+
+# These are named AWS accounts that I have added.  
+# TODO: move to ansible with dict/list
+# going to use a group reference on the role side
+  # ServiceGroup: 
+  #   Type: 'AWS::IAM::Group'
+  #   Properties: 
+  #     GroupName: 
+  #       Fn::Join: [ '-', [ Ref: ResourcePrefix, "ServiceGroupRole" ] ]
+  #     ManagedPolicyArns: 
+  #     - !Ref UserS3ObjectPolicy
+  #   DependsOn: 
+  #   - UserS3ObjectPolicy
+
+  # User1Resource:
+  #   Type: 'AWS::IAM::User'
+  #   Properties:
+  #     UserName: 
+  #       aws_user1
+  #     Path: /
+  #     LoginProfile:
+  #       Password: 
+  #         Ref: S3clientPassword
+  #     Groups: 
+  #     - Ref: ServiceGroup
+  #   DependsOn: 
+  #   - ServiceGroup
+
+  # User2Resource:
+  #   Type: 'AWS::IAM::User'
+  #   Properties:
+  #     UserName: 
+  #       aws_user2
+  #     Path: /
+  #     LoginProfile:
+  #       Password: 
+  #         Ref: S3clientPassword
+  #     Groups: 
+  #     - Ref: ServiceGroup
+  #   DependsOn: 
+  #   - ServiceGroup
+
+  # User3Resource:
+  #   Type: 'AWS::IAM::User'
+  #   Properties:
+  #     UserName: 
+  #       aws_user3
+  #     Path: /
+  #     LoginProfile:
+  #       Password: 
+  #         Ref: S3clientPassword
+  #     Groups: 
+  #     - Ref: ServiceGroup
+  #   DependsOn: 
+  #   - ServiceGroup
+
+Outputs:
+  BucketName:
+    Value:
+     Ref: clientS3Bucket
+  # clientAdmin:
+  #   Value:
+  #    Ref: clientAdmin
+  BucketARN:
+    Value:
+      Fn::GetAtt:
+      - clientS3Bucket
+      - Arn
